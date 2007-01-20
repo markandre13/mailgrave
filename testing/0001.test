@@ -1,0 +1,95 @@
+#!/bin/sh -ex
+
+rm -rf tmp
+mkdir tmp 
+cd tmp   
+
+killall mailgrave-queue  || :
+killall mailgrave-smtpd  || :
+killall mailgrave-send   || :
+killall mailgrave-remote || :
+
+cleanup() {
+  kill -15 $PID0 $PID1 $PID2 $PID3 $PID4 $PID5
+}
+
+trap 'cleanup' EXIT
+trap 'cleanup' SIGINT
+
+PATH=../../../src:$PATH
+export PATH
+
+mkdir smtpd1
+cd smtpd1
+
+mailgrave-queue &
+PID0=$!
+
+mailgrave-smtpd --port 2525 &
+PID1=$!
+
+sleep 2
+
+mailgrave-send &
+PID2=$!
+
+mailgrave-remote --verbose --relay 127.0.0.1 --port 2526 &
+PID3=$!
+
+cd ..
+mkdir smtpd2
+cd smtpd2
+
+mailgrave-queue &
+PID4=$!
+
+#mailgrave-smtpd --slow --port 2526 &
+mailgrave-smtpd --port 2526 &
+PID5=$!
+
+cd ..
+
+# wait for processes to start
+sleep 2
+
+# send email to smtpd
+../client \
+  helo foo \
+  mailfrom '<sender@s.t>' \
+  rcptto '<receiver@r.o>' \
+  data foobar \
+  quit
+
+#sleep 3600
+#exit 0
+
+# give processes a chance to finish their tasks
+sleep 2
+
+test ! -f smtpd1/00000000000000000000.dat
+test ! -f smtpd1/00000000000000000000.env
+test -f smtpd2/00000000000000000000.dat
+test -f smtpd2/00000000000000000000.env
+
+#
+# test mailgrave-inject
+#
+
+cd smtpd1
+mailgrave-inject <<EOF
+From: mark@east.com
+To: gita@west.com
+Subject: Test
+
+fubar
+EOF
+cd ..
+
+sleep 2
+
+test ! -f smtpd1/00000000000000000001.dat
+test ! -f smtpd1/00000000000000000001.env
+test -f smtpd2/00000000000000000001.dat
+test -f smtpd2/00000000000000000001.env
+
+echo "Ok"

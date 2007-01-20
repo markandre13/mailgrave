@@ -1,0 +1,235 @@
+
+           MailGrave -- a simple smtpd daemon influenced by qmail
+       Copyright (C) 2006, 2007 by Mark-André Hopf <mhopf@mark13.org>
+
+NOTE: This is only a prototype I created during a single weekend. The code
+is ugly and buggy as hell.
+
+What you can do with the current code:
+  
+  o Compile the source:
+    make
+  o Place an email into the mail queue (current working directory) 
+     ./mailgrave-inject < test1
+  o Forward the email from the mail queue to 127.0.0.1:25
+    ./mailgrave-send
+  o Each program comes with a --help option and various other parameters
+    so they can be used as standalone programs.
+    They also do not take arguments from environment variables, which is
+    unlike their qmail equivalents.
+    The intention of this is that the system administrator can invoke the
+    programs on the command line to debug his current mail setup.
+
+Berlin, 2006-10-08
+Mark-André Hopf <mhopf@mark13.org>
+
+Architecture
+^^^^^^^^^^^^
+
+ mailgrave-inject       mailgrave-smtpd 
+       |                       |
+       +-----------+-----------+
+                   |
+                   V
+             (queue.ctrl)
+             mailgrave-queue
+                   |
+                   V
+        [ the queue directory ]
+                   |
+                   V
+              (send.ctrl)
+             mailgrave-send
+                   |
+       +-----------+-----------+
+       |                       |
+       V                       V
+  (local.ctrl)           (remote.ctrl)
+ mailgrave-local        mailgrave-remote
+
+ [...] directory
+ (...) unix domain socket
+
+Installation Example
+^^^^^^^^^^^^^^^^^^^^
+Mailgrave can use different users and chroot'ed directories so separate its
+processes.
+
+Directory structure:
+
+/
+  var/
+    spool/
+      mailgrave/
+        smtpd/
+          queue.ctrl
+        queue/
+          send.ctrl
+          remote.ctrl
+          local.ctrl
+        remote/
+	local/
+
+------------------------------------------------------------------------
+#!/bin/sh
+#
+# script to create a daemontools/runit setup for mailgrave
+#
+
+groupadd -r mailgrave
+
+for x in smtpd queue send remote
+do
+
+useradd -d /var/spool/mailgrave -g mailgrave -r mailgrave-$x
+mkdir -p /var/spool/mailgrave/$x
+mkdir -p /var/log/mailgrave-$x
+cat>/var/log/mailgrave-$x/config<<EOF
+s65535
+n4
+EOF
+mkdir -p /var/service/.mailgrave-$x/log
+cat>/var/service/.mailgrave-$x/log/run<<EOF
+#!/bin/sh
+exec svlogd -tt /var/log/mailgrave-$x
+EOF
+chmod a+x /var/service/.mailgrave-$x/log/run
+
+done
+  
+chown -R mailgrave-queue:mailgrave /var/spool/mailgrave/
+
+cat>/var/service/.mailgrave-smtpd/run<<EOF
+#!/bin/sh
+exec 2>&1
+exec mailgrave-smtpd \\
+  --bind 127.0.0.1 --port 25 \\
+  --out queue.ctrl \\
+  --chroot /var/spool/mailgrave/smtpd --user mailgrave-smtpd
+EOF
+
+cat>/var/service/.mailgrave-queue/run<<EOF
+#!/bin/sh
+exec 2>&1
+exec mailgrave-queue \\
+  --in /var/spool/mailgrave/smtpd/queue.ctrl \\
+  --out send.ctrl \\
+  --chroot /var/spool/mailgrave/queue --user mailgrave-queue
+EOF
+
+cat>/var/service/.mailgrave-send/run<<EOF
+#!/bin/sh
+exec 2>&1
+exec mailgrave-send \\
+  --in /var/spool/mailgrave/queue/send.ctrl \\
+  --out remote.ctrl \\
+  --chroot /var/spool/mailgrave/queue --user mailgrave-queue
+EOF
+
+cat>/var/service/.mailgrave-remote/run<<EOF
+#!/bin/sh
+exec 2>&1
+SMTP_AUTH_PASSWORD=bar
+export SMTP_AUTH_PASSWORD
+exec mailgrave-remote \\
+  --in /var/spool/mailgrave/queue/remote.ctrl \\
+  --relay 127.0.0.1 --port 525 \\
+  --login foo \\
+  --chroot /var/spool/mailgrave/remote --user mailgrave-remote
+EOF
+
+#cat>/var/service/.mailgrave-local/run<<EOF
+##!/bin/sh
+#exec mailgrave-local \\
+#  --in /var/spool/mailgrave/send/local.ctrl \\
+#EOF
+
+for x in smtpd queue send remote
+do
+  chmod a+x /var/service/.mailgrave-$x/run
+#  mv /var/service/.mailgrave-$x /var/service/mailgrave-$x
+done
+------------------------------------------------------------------------
+
+o mailgrave-queue
+  - reads mail from fd 0
+  - reads envelope information from fd 1
+    - envelope sender address (F...\0)
+    - envelope receipient addresses (T...\0)
+    - every envelope receipient address must be name@fqdn
+    - adds 'Received' line to the top of the message
+  - places stuff into queue for mailgrave-send
+
+o mailgrave-send
+  - reads the queue
+  - calls mailgrave-local to deliver locally
+  - calls mailgrave-remote to deliver remote
+  - logs to fd 0
+  - also calls mailgrave-clean (?)
+
+o mailgrave-local
+
+o mailgrave-smtpd
+  telnet 127.0.0.1 2525
+  HELO foo
+  MAIL FROM:<foo@bar.us>
+  RCPT TO:<yo@x.y>
+
+   - need to wait for dead children or zombies will come to live
+   - error handling is not correct (checks and error codes)
+   - code review for security issues needs to be done
+
+group=mailgrave
+user=mailgrave
+bindir=/usr/lib/mailgrave
+servicedir=/services
+queuedir=/var/spool/mailgrave
+
+smtp_relay=smtp.1und1.de
+smpt_auth_login=mrfoo
+smtp_auth_password=secret
+
+mkdir -p $bindir
+mkdir -p $servicedir
+mkdir -p $queuedir
+chown $user:$group $queuedir
+chmod go-rwx $queuedir
+cp mailgrave-inject \
+   mailgrave-queue \
+   mailgrave-remote \
+   mailgrave-send \
+   mailgrave-smtpd \
+   $bindir
+
+mkdir $servicedir/mailgrave-queue
+cat<<EOF > $servicedir/mailgrave-queue
+#!/bin/sh
+chpst -u $user:$group -/ $queuedir mailgrave-queue
+EOF
+
+mkdir $servicedir/mailgrave-smtpd
+cat<<EOF > $servicedir/mailgrave-smtpd
+#!/bin/sh
+chpst -u $user:$group -/ $queuedir mailgrave-smtpd \
+  --bind 127.0.0.1 \
+  --port 25
+EOF
+
+mkdir $servicedir/mailgrave-send
+cat<<EOF > $servicedir/mailgrave-send
+#!/bin/sh
+chpst -u $user:$group -/ $queuedir mailgrave-send \
+  --relay "$smtp_relay" \
+  --user "$smtp_auth_user" \
+  --password "$smtp_auth_password"
+EOF
+
+chpst -u mailgraves:mailgrave -/ /var/spool/mailgrave mailgrave-send
+#chpst -u mailgrave:mailgrave -/ /var/spool/mailgrave mailgrave-local
+#chpst -u mailgrave:mailgrave -/ /var/spool/mailgrave mailgrave-remote
+
+HELO test
+MAIL FROM:<foo@localhost>
+RCPT TO:<bar@localhost>
+DATA
+QUIT
